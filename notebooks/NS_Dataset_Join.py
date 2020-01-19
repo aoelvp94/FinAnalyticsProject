@@ -37,12 +37,15 @@ def fill_joined_missing_fields(df):
                 df.iloc[-i,8] = df.iloc[-i+1,8]
                 df.iloc[-i,9] = df.iloc[-i+1,9]
          
-#Calculamos las medias de 50 y 200 dias, asi como la señal en base a la posicion.
-def calculate_averages_50_200(df):
+
+#Introducimos labels al dataset, calculando medias 50 y 200 dias.
+'''(REVEER!)'''    
+def labeling_df(df):
     df['50_days_average'] = df.iloc[:,3].rolling(window=50).mean()
     df['200_days_average'] = df.iloc[:,3].rolling(window=200).mean()
     df.loc[df['50_days_average'] >= df['200_days_average'], 'Buy/Sell'] = -1 #Si la media de corto plazo supera a la de largo, es posicion de sell
     df.loc[df['50_days_average'] < df['200_days_average'], 'Buy/Sell'] = 1 #Si la media de corto plazo esta por debajo de la de largo, es posicion de buy
+    return df
  
 #Visualizacion de la evolucion de precios y las medias.
 def visualize_close_50_200(df):
@@ -50,13 +53,99 @@ def visualize_close_50_200(df):
     plt.plot(df['50_days_average'])
     plt.plot(df['200_days_average'])
     plt.legend(['Close','50_days_avg','200_days_avg'])
-    plt.title('Evolution of the MTUM over time')
+    plt.title('Evolution of MTUM ETF over time')
     plt.show()
+
+#Consigue los weights para la diferenciacion!
+def getWeights_FFD(d,size):
+    w=[1.]
+    for k in range(1,size):
+        w_=-w[-1]/k*(d-k+1)
+        w.append(w_)
+    w=np.array(w[::-1]).reshape(-1,1)
+    return w
+
+#Funcion aux para pesos de FFD
+def plotWeights(dRange,nPlots,size):
+    w=pd.DataFrame()
+    for d in np.linspace(dRange[0],dRange[1],nPlots):
+        w_=getWeights_FFD(d,size=size)
+        w_=pd.DataFrame(w_,index=range(w_.shape[0])[::-1],columns=[d])
+        w=w.join(w_,how='outer')
+    ax=w.plot()
+    ax.legend(loc='upper right');plt.show()
+    return
+
+#Diferenciamos la serie! d es el orden de diferenciacion. "Thres" (threshold) maneja la acceptabilidad de las exclusiones. No modificar.
+def fracDiff(series,d,thres=0.01):
+
+    w=getWeights_FFD(d,series.shape[0])
+
+    w_=np.cumsum(abs(w))
+    w_/=w_[-1]
+    skip=w_[w_>thres].shape[0]
+
+    df={}
+    for name in series.columns:
+        seriesF,df_=series[[name]].fillna(method='ffill').dropna(),pd.Series()
+        for iloc in range(skip,seriesF.shape[0]):
+            loc=seriesF.index[iloc]
+
+            df_[loc]=np.dot(w[-(iloc+1):,:].T,seriesF.loc[:loc])[0,0]
+        df[name]=df_.copy(deep=True)
+    df=pd.concat(df,axis=1)
+    return df
+
+#Funcion para buscar el mejor d
+def plotMinFFD(df):
+    from statsmodels.tsa.stattools import adfuller
+    import numpy.ma as ma
+    out=pd.DataFrame(columns=['adfStat','pVal','lags','nObs','95% conf','corr'])
+    for d in np.linspace(0,1,21):
+        df1=np.log(df[['Close']]).resample('1D').last() # Pasar a observaciones diarias
+        df2=fracDiff(df1,d,thres=.01)
+        corr = ma.corrcoef(ma.masked_invalid(df1.loc[df2.index,'Close']), ma.masked_invalid(df2['Close']))[0,1]
+        df2=adfuller(df2['Close'],maxlag=1,regression='c',autolag=None)
+        out.loc[d]=list(df2[:4])+[df2[4]['5%']]+[corr] # Aportar valores criticos
+    out[['adfStat','corr']].plot(secondary_y='adfStat')
+    plt.axhline(out['95% conf'].mean(),linewidth=1,color='r',linestyle='dotted')
+    plt.show()
+    return out
+
+#Obtiene los factores de tiempo para restar importancia a las observaciones.
+def getTimeDecay(tW,clfLastW):
+    clfW=tW.sort_index().cumsum()
+    if clfLastW>=0:slope=(1.-clfLastW)/clfW.iloc[-1]
+    else:slope=1./((clfLastW+1)*clfW.iloc[-1])
+    const=1.-slope*clfW.iloc[-1]
+    clfW=const+slope*clfW
+    clfW[clfW<0]=0
+    # print(const,slope)
+    return clfW
 
 
 if __name__ == '__main__':
     df = load_and_join()
-    fill_joined_missing_fields(df)
-    calculate_averages_50_200(df)
-    df = df.iloc[200:,:]
+    fill_joined_missing_fields(df)  
+    
+    #Diferenciacion fraccionaria: Buscando el mejor d, d* = 0.1
+    plt.figure(1)
+    out = plotMinFFD(df)
+    
+    #Usando la diferenciacion con d = 0.05
+    df_ffd = fracDiff(df,0.05)    
+    
+    #Ploteando series
+    df = labeling_df(df)
+    plt.figure(2)
     visualize_close_50_200(df)
+    
+    df_ffd = labeling_df(df_ffd)
+    plt.figure(3)
+    visualize_close_50_200(df_ffd)
+    
+    time_decay = getTimeDecay(df[['Close']],0)
+    
+    #1 Revisar el labeling!
+    #2 Falta aplicar el time_decay (y precisarlo!)
+    #3 Elegir si usar ffd (tiene menos obs!)
